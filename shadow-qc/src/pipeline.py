@@ -14,7 +14,6 @@ from .shadow_mask import compute_shadow_mask
 from .utils import (
     ensure_dir,
     find_images,
-    load_config,
     normalize_percentile,
     read_and_preprocess,
 )
@@ -31,11 +30,12 @@ def process_single_image(
     feat_cfg = config.get("features", {})
     mask_cfg = config.get("shadow_mask", {})
 
-    # Препроцессинг
-    lab, L, original_bgr = read_and_preprocess(
+    # Препроцессинг (original_bgr не нужен в воркере — экономим память)
+    lab, L, _ = read_and_preprocess(
         image_path,
         max_side=img_cfg.get("max_side", 1280),
         blur_sigma=img_cfg.get("blur_sigma", 1.0),
+        return_original=False,
     )
 
     # Нормализация
@@ -95,7 +95,7 @@ def run_pipeline(
     n_workers = workers if workers is not None else par_cfg.get("workers", 0)
     if n_workers == 0:
         import os
-        n_workers = max(1, os.cpu_count() - 1)
+        n_workers = max(1, (os.cpu_count() or 2) - 1)
 
     # Поиск изображений
     images = find_images(in_dir, extensions)
@@ -188,7 +188,7 @@ def _write_metadata(config: dict, decisions: Dict[Path, Decision]):
     print(f"\n[Shadow-QC] Запись метаданных ({len(decisions)} файлов)...")
     try:
         writer = MetadataWriter(config)
-        success, errors = writer.write_batch_stay_open(
+        success, errors = writer.write_batch_grouped(
             decisions,
             progress_callback=lambda cur, tot: None,  # tqdm уже отработал
         )

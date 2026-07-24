@@ -1,13 +1,15 @@
 """Классификация кадров: правила по порогам или ML-модель."""
 
+import logging
 import pickle
 from enum import Enum
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 
 from .features import FeatureVector
+
+logger = logging.getLogger(__name__)
 
 
 class Decision(str, Enum):
@@ -48,7 +50,8 @@ def classify_by_rules(fv: FeatureVector, config: dict) -> Decision:
 
 
 def classify_by_ml(
-    fv: FeatureVector, model_path: str, prob_bad: float = 0.70, prob_good: float = 0.70
+    fv: FeatureVector, model_path: str, config: dict,
+    prob_bad: float = 0.70, prob_good: float = 0.70,
 ) -> Decision:
     """
     Классификация через обученную модель (LogisticRegression / RandomForest).
@@ -56,8 +59,11 @@ def classify_by_ml(
     """
     model = _load_model(model_path)
     if model is None:
-        # Fallback на правила если модель не найдена
-        return classify_by_rules(fv, {})
+        # Fallback на правила с полным конфигом пользователя
+        logger.warning(
+            "ML-модель не найдена (%s), fallback на правила.", model_path
+        )
+        return classify_by_rules(fv, config)
 
     # Формируем вектор признаков в том же порядке, что при обучении
     feature_vec = _feature_vector_to_array(fv)
@@ -87,31 +93,16 @@ def classify(fv: FeatureVector, config: dict) -> Decision:
         model_path = cls_cfg.get("ml_model_path", "")
         prob_bad = cls_cfg.get("prob_bad_threshold", 0.70)
         prob_good = cls_cfg.get("prob_good_threshold", 0.70)
-        return classify_by_ml(fv, model_path, prob_bad, prob_good)
+        return classify_by_ml(fv, model_path, config, prob_bad, prob_good)
     else:
         return classify_by_rules(fv, config)
 
 
 def _feature_vector_to_array(fv: FeatureVector) -> np.ndarray:
     """Преобразует FeatureVector в numpy-массив для ML-модели."""
-    return np.array([
-        fv.rms_contrast,
-        fv.michelson_pct,
-        fv.dynamic_range,
-        fv.histogram_entropy,
-        fv.bimodality,
-        fv.clipped_highlight_ratio,
-        fv.local_contrast_p95,
-        fv.local_contrast_p50,
-        fv.sobel_p95,
-        fv.edge_pixel_ratio,
-        fv.shadow_area_ratio,
-        fv.boundary_gradient_mean,
-        fv.boundary_brightness_drop,
-        fv.boundary_length_norm,
-        fv.chroma_diff_at_boundary,
-        fv.shadow_score,
-    ], dtype=np.float32)
+    return np.array(
+        [getattr(fv, name) for name in FEATURE_NAMES], dtype=np.float32
+    )
 
 
 FEATURE_NAMES = [
@@ -141,5 +132,6 @@ def _load_model(path: str):
     try:
         with open(path, "rb") as f:
             return pickle.load(f)
-    except Exception:
+    except Exception as e:
+        logger.error("Не удалось загрузить модель '%s': %s", path, e)
         return None

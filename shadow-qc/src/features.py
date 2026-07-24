@@ -6,7 +6,7 @@ from typing import Dict
 import cv2
 import numpy as np
 
-from .shadow_mask import compute_shadow_mask, get_shadow_boundary
+from .shadow_mask import get_shadow_boundary
 
 
 @dataclass
@@ -95,6 +95,12 @@ def extract_features(
     # === Градиентные признаки ===
     L_uint8 = (L_norm * 255).astype(np.uint8)
 
+    # Градиент на границе (Scharr — точнее для разделения жёстких/мягких границ)
+    scharr_x = cv2.Scharr(L_uint8, cv2.CV_32F, 1, 0)
+    scharr_y = cv2.Scharr(L_uint8, cv2.CV_32F, 0, 1)
+    scharr_mag = np.sqrt(scharr_x**2 + scharr_y**2)
+
+    # Sobel — для общего признака sobel_p95
     sobel_x = cv2.Sobel(L_uint8, cv2.CV_32F, 1, 0, ksize=3)
     sobel_y = cv2.Sobel(L_uint8, cv2.CV_32F, 0, 1, ksize=3)
     sobel_mag = np.sqrt(sobel_x**2 + sobel_y**2)
@@ -116,8 +122,8 @@ def extract_features(
     boundary_count = np.sum(boundary_pixels)
 
     if boundary_count > 0:
-        # Средний градиент на границе
-        fv.boundary_gradient_mean = float(np.mean(sobel_mag[boundary_pixels]))
+        # Средний градиент на границе (Scharr по спецификации)
+        fv.boundary_gradient_mean = float(np.mean(scharr_mag[boundary_pixels]))
 
         # Перепад яркости поперёк границы
         fv.boundary_brightness_drop = _boundary_brightness_drop(
@@ -155,12 +161,20 @@ def _local_std(L: np.ndarray, window: int) -> np.ndarray:
 def _otsu_separability(L_norm: np.ndarray) -> float:
     """Межклассовая дисперсия Отсу как мера бимодальности."""
     L_uint8 = (L_norm * 255).astype(np.uint8)
-    # cv2.threshold возвращает (thresh, dst); otsu_val = межклассовая дисперсия
-    otsu_val, _ = cv2.threshold(
+    # cv2.threshold возвращает оптимальный порог; вычисляем sigma_b² вручную
+    thresh_val, _ = cv2.threshold(
         L_uint8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
     )
-    # Нормируем на максимум (255^2 / 4 = теоретический максимум)
-    return float(otsu_val / (255.0 * 255.0 / 4.0 + 1e-6))
+    t = int(thresh_val)
+    w0 = float(np.mean(L_uint8 <= t))
+    w1 = 1.0 - w0
+    if w0 < 1e-6 or w1 < 1e-6:
+        return 0.0
+    mu0 = float(np.mean(L_uint8[L_uint8 <= t]))
+    mu1 = float(np.mean(L_uint8[L_uint8 > t]))
+    sigma_b2 = w0 * w1 * (mu0 - mu1) ** 2
+    # Нормируем на теоретический максимум (255² / 4)
+    return float(sigma_b2 / (255.0 * 255.0 / 4.0 + 1e-6))
 
 
 def _boundary_brightness_drop(
@@ -209,14 +223,12 @@ def _chroma_diff_at_boundary(lab: np.ndarray, boundary: np.ndarray) -> float:
     a = lab[:, :, 1].astype(np.float32)
     b = lab[:, :, 2].astype(np.float32)
 
-    # Градиент цветности
-    a_grad = cv2.Sobel(a, cv2.CV_32F, 1, 0, ksize=3) + cv2.Sobel(
-        a, cv2.CV_32F, 0, 1, ksize=3
-    )
-    b_grad = cv2.Sobel(b, cv2.CV_32F, 1, 0, ksize=3) + cv2.Sobel(
-        b, cv2.CV_32F, 0, 1, ksize=3
-    )
-    chroma_grad = np.abs(a_grad) + np.abs(b_grad)
+    # Градиент цветности (модули по отдельности — без взаимной компенсации)
+    a_dx = cv2.Sobel(a, cv2.CV_32F, 1, 0, ksize=3)
+    a_dy = cv2.Sobel(a, cv2.CV_32F, 0, 1, ksize=3)
+    b_dx = cv2.Sobel(b, cv2.CV_32F, 1, 0, ksize=3)
+    b_dy = cv2.Sobel(b, cv2.CV_32F, 0, 1, ksize=3)
+    chroma_grad = np.abs(a_dx) + np.abs(a_dy) + np.abs(b_dx) + np.abs(b_dy)
 
     return float(np.mean(chroma_grad[boundary_px]))
 
@@ -228,7 +240,7 @@ def _compute_shadow_score(fv: FeatureVector) -> float:
     """
     # Нормируем каждый признак в [0, 1] эмпирическими максимумами
     brightness_drop_norm = min(fv.boundary_brightness_drop / 0.5, 1.0)
-    gradient_norm = min(fv.boundary_gradient_mean / 80.0, 1.0)
+    gradient_norm = min(fv.boundary_gradient_mean / 320.0, 1.0)  # Scharr: масштаб ~4x Sobel
     area_norm = min(fv.shadow_area_ratio / 0.5, 1.0)
     length_norm = min(fv.boundary_length_norm / 2.0, 1.0)
     # Инвертируем chroma_diff: мало цвета = больше похоже на тень

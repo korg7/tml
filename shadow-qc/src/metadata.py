@@ -59,6 +59,10 @@ class MetadataWriter:
             f"-XMP-xmp:Label={label}",
         ]
 
+        # Очищаем старые QC-ключевые слова перед добавлением новых
+        cmd.append(f"-XMP-dc:Subject-={self.keyword_prefix}*")
+        cmd.append(f"-IPTC:Keywords-={self.keyword_prefix}*")
+
         # Добавляем ключевые слова
         for kw in keywords:
             cmd.append(f"-XMP-dc:Subject+={kw}")
@@ -105,12 +109,11 @@ class MetadataWriter:
 
         return success, errors
 
-    def write_batch_stay_open(
+    def write_batch_grouped(
         self, decisions: Dict[Path, Decision], progress_callback=None
     ) -> Tuple[int, int]:
         """
-        Пакетная запись через ExifTool в режиме -stay_open (быстрее для больших объёмов).
-        Группирует файлы по классам и пишет за минимум вызовов.
+        Пакетная запись через ExifTool с группировкой по классам (минимум вызовов).
         """
         # Группируем файлы по решениям
         groups: Dict[Decision, List[Path]] = {
@@ -142,6 +145,9 @@ class MetadataWriter:
                 f"-XMP-acdsee:Rating={rating}",
                 f"-XMP-xmp:Label={label}",
             ]
+            # Очищаем старые QC-теги перед добавлением
+            cmd.append(f"-XMP-dc:Subject-={self.keyword_prefix}*")
+            cmd.append(f"-IPTC:Keywords-={self.keyword_prefix}*")
             for kw in keywords:
                 cmd.append(f"-XMP-dc:Subject+={kw}")
                 cmd.append(f"-IPTC:Keywords+={kw}")

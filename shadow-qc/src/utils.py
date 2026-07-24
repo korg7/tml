@@ -1,8 +1,7 @@
 """Утилиты: чтение изображений, resize, конвертация в LAB, хелперы."""
 
-import os
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -33,14 +32,19 @@ def read_and_preprocess(
     image_path: Path,
     max_side: int = 1280,
     blur_sigma: float = 1.0,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    return_original: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
     """
     Читает изображение, уменьшает, размывает, конвертирует в LAB.
+
+    Args:
+        return_original: если True, возвращает копию BGR до размытия (для визуализации).
+                         Если False, третий элемент — None (экономия памяти в воркерах).
 
     Returns:
         lab: изображение в LAB (uint8, OpenCV формат)
         L: яркостный канал, float32, нормализованный 0..1
-        original_bgr: уменьшенное BGR-изображение (для визуализации)
+        original_bgr: уменьшенное BGR-изображение (или None)
     """
     bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
     if bgr is None:
@@ -54,7 +58,7 @@ def read_and_preprocess(
         new_h = int(h * scale)
         bgr = cv2.resize(bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-    original_bgr = bgr.copy()
+    original_bgr = bgr.copy() if return_original else None
 
     # Лёгкое размытие для подавления JPEG-артефактов
     if blur_sigma > 0:

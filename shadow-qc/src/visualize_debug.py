@@ -5,7 +5,6 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .features import extract_features
 from .shadow_mask import compute_shadow_mask, get_shadow_boundary
 from .utils import normalize_percentile, read_and_preprocess
 

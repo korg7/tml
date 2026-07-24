@@ -76,6 +76,13 @@ def main():
 
     config = load_config(str(config_path))
 
+    # Разрешаем относительные пути из конфига относительно расположения файла конфигурации
+    config_base = config_path.resolve().parent
+    for key in ("input_dir", "output_csv", "debug_dir"):
+        val = config.get(key)
+        if val and not Path(val).is_absolute():
+            config[key] = str(config_base / val)
+
     # Переопределения из CLI
     if args.output:
         config["output_csv"] = args.output
