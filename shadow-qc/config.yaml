@@ -1,0 +1,55 @@
+# Конфигурация Shadow-QC: автоотбраковка кадров с жёсткими тенями
+
+input_dir: "data/input"
+output_csv: "data/predictions.csv"
+debug_dir: "debug"
+dry_run: true  # true = не писать метаданные, только CSV
+
+image:
+  max_side: 1280
+  blur_sigma: 1.0
+  extensions:
+    - ".jpg"
+    - ".jpeg"
+    - ".png"
+    - ".tif"
+    - ".tiff"
+
+features:
+  local_window: 48
+  canny_low: 50
+  canny_high: 150
+  dark_sigma_k: 0.7
+  percentile_low: 1
+  percentile_high: 99
+
+shadow_mask:
+  method: "combined"  # combined | lab_threshold | silva
+  morph_kernel: 5
+  min_area_px: 500
+  specthem_threshold: 1.0
+
+classification:
+  mode: "rules"  # rules | ml
+  good_shadow_score_max: 0.25
+  good_local_contrast_max: 0.22
+  bad_shadow_score_min: 0.55
+  bad_local_contrast_min: 0.38
+  # ML-режим (после калибровки):
+  ml_model_path: ""
+  prob_bad_threshold: 0.70
+  prob_good_threshold: 0.70
+
+metadata:
+  enabled: true
+  exiftool_path: "exiftool"
+  rating_good: 5
+  rating_review: 3
+  rating_bad: 1
+  label_good: "Green"
+  label_review: "Yellow"
+  label_bad: "Red"
+  keyword_prefix: "QC_"
+
+parallel:
+  workers: 0  # 0 = auto (cpu_count)

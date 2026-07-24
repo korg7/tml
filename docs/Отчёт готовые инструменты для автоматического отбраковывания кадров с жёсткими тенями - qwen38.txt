@@ -1,0 +1,1492 @@
+# Отчёт: готовые инструменты для автоматического отбраковывания кадров с жёсткими тенями  
+**Цель:** собрать локальный сервис / фреймворк, который пакетно анализирует фотографии стройплощадки, помечает кадры как *хорошие / плохие / пограничные* и пишет разметку в метаданные, чтобы потом можно было фильтровать в ACDSee.
+
+> **Короткий вывод:**  
+> Для быстрого рабочего прототипа лучше всего использовать связку:  
+> **Python + OpenCV + scikit-image + scikit-learn + ExifTool + Streamlit/Gradio**.  
+> Для более серьёзного локального сервиса с ручной корректировкой: **FastAPI + SQLite/PostgreSQL + Label Studio + ExifTool**.  
+> Писать в файлы лучше стандартные поля: **XMP Rating, XMP Label, XMP Keywords / IPTC Keywords**.  
+> Начинать лучше не с нейросети, а с классических признаков: локальный контраст, резкие перепады яркости, площадь тёмных областей, сила границ теней. Уже потом, если понадобится точность, добавлять ONNX / PyTorch shadow-detection модель.
+
+---
+
+## 0. Что реально есть готового на GitHub
+
+Важно понимать: **одного готового production-ready репозитория “hard shadow detector for industrial drone photos”**, который можно просто скачать и сразу получить качественную разметку, скорее всего нет. Задача слишком доменная: бетон, металл, тёмные покрытия, блики, пыль, разное время суток, JPEG-сжатие.
+
+Но есть отличные готовые кирпичи, из которых можно собрать свой локальный инструмент.
+
+### Основные GitHub-репозитории, которые стоит использовать
+
+| Категория | Инструмент | GitHub | Зачем нужен |
+|---|---|---|---|
+| Компьютерное зрение | OpenCV | https://github.com/opencv/opencv | Чтение изображений, resize, Canny, Sobel, морфология, локальные фильтры, фон-детекторы |
+| Компьютерное зрение | scikit-image | https://github.com/scikit-image/scikit-image | Удобные фильтры, local contrast, entropy, SLIC superpixels, морфология |
+| Изображения | Pillow | https://github.com/python-pillow/Pillow | Простое чтение, thumbnails, быстрая подготовка превью |
+| Быстрая обработка больших фото | libvips / pyvips | https://github.com/libvips/libvips <br> https://github.com/libvips/pyvips | Очень быстрая и экономная обработка больших JPEG/TIFF |
+| Метаданные | ExifTool | https://github.com/exiftool/exiftool | Золотой стандарт записи XMP/IPTC/EXIF |
+| Метаданные из Python | pyexiftool | https://github.com/sylikc/pyexiftool | Обёртка над ExifTool |
+| Метаданные альтернатива | exiv2 | https://github.com/Exiv2/exiv2 | Чтение/запись EXIF/IPTC/XMP |
+| Классификация / калибровка порогов | scikit-learn | https://github.com/scikit-learn/scikit-learn | LogisticRegression, RandomForest, подбор порогов, кросс-валидация |
+| Локальный GUI | Streamlit | https://github.com/streamlit/streamlit | Очень быстрый прототип веб-интерфейса |
+| Локальный GUI | Gradio | https://github.com/gradio-app/gradio | Удобный UI для ML-инструментов, превью, слайдеры |
+| Локальный сервер / API | FastAPI | https://github.com/fastapi/fastapi | Backend, REST API, локальный сервис |
+| Шаблон Full-stack FastAPI | full-stack-fastapi-template | https://github.com/fastapi/full-stack-fastapi-template | Если нужен более серьёзный каркас |
+| Ручная разметка / корректировка | Label Studio | https://github.com/HumanSignal/label-studio | Локальный сервер разметки, удобно для ручной коррекции |
+| Разметка масок / сложнее | CVAT | https://github.com/cvat-ai/cvat | Если позже понадобится сегментация теней |
+| CPU inference | ONNX Runtime | https://github.com/microsoft/onnxruntime | Запуск нейросетей без тяжёлого PyTorch |
+| Intel CPU inference | OpenVINO | https://github.com/openvinotoolkit/openvino | Ускорение моделей на Intel CPU |
+| RAW | rawpy | https://github.com/letmaik/rawpy | Если исходники в RAW |
+| File watcher | watchdog | https://github.com/gorakhargosh/watchdog | Слежение за папкой, автозапуск обработки |
+| Image Quality Assessment | IQA-PyTorch | https://github.com/chaofengc/IQA-PyTorch | Опционально: blur/noise/quality, но не shadow-specific |
+| Поиск shadow-моделей | GitHub topic: shadow-detection | https://github.com/topics/shadow-detection | Исследовательские репозитории по детекции теней |
+| Поиск моделей | Papers with Code: Shadow Detection | https://paperswithcode.com/task/shadow-detection | Поиск моделей и датасетов |
+
+---
+
+## 1. Методы и метрики измерения контраста
+
+### 1.1. Глобальные метрики контраста
+
+Это самые простые метрики. Они полезны, но для вашей задачи их **недостаточно**, потому что кадр может быть контрастным из-за фактуры бетона, металла, арматуры, а не из-за теней.
+
+| Метрика | Суть | Плюсы | Минусы |
+|---|---|---|---|
+| **Michelson contrast** | `(Lmax - Lmin) / (Lmax + Lmin)` | Простая, понятная | Чувствительна к выбросам, бликам, шуму |
+| **Percentile Michelson** | `(p99 - p1) / (p99 + p1)` | Устойчивее к выбросам | Всё ещё глобальная |
+| **RMS contrast** | `std(L)` | Простая, быстрая | Не различает текстуру и тени |
+| **Dynamic range** | `p99 - p1` | Полезна для оценки освещённости | Не говорит о жёсткости теней |
+| **Histogram entropy** | Энтропия гистограммы яркости | Полезна для оценки сложности сцены | Слабо связана именно с тенями |
+| **Local RMS contrast** | `std(L)` в скользящем окне | Гораздо лучше для теней | Дороже вычислительно |
+| **Local mean contrast** | `(mean_light - mean_dark) / (mean_light + mean_dark)` по окнам | Хорошо ловит перепады | Нужно аккуратно выбирать масштаб |
+| **Gradient magnitude** | Sobel / Scharr / Laplacian | Ловит границы | Реагирует и на текстуру, и на JPEG-артефакты |
+| **Edge density** | Доля Canny/Sobel edge pixels | Полезна для оценки “жёсткости” сцены | Нужно отделять текстуру от теневых границ |
+| **Otsu separability / bimodality** | Насколько гистограмма делится на тёмную и светлую части | Может ловить сцены с крупными тенями | Может срабатывать на тёмные объекты |
+
+---
+
+### 1.2. Что лучше подходит именно для жёстких теней
+
+Жёсткая тень — это не просто “тёмно”. Это обычно:
+
+1. **Резкая граница** между светлой и тёмной областью.
+2. **Большой перепад яркости** через границу.
+3. **Относительно стабильный цветовой тон** внутри тени.
+4. **Крупные области**, а не мелкая текстура.
+5. **Граница тени мешает стабилизации**, потому что алгоритм отслеживает её как контрастный объект.
+
+Поэтому лучшие признаки — не глобальный контраст, а комбинация:
+
+- локальный контраст яркости;
+- сила градиента на границах;
+- перепад яркости поперёк границы;
+- площадь тёмных областей;
+- длина и резкость границ тёмных областей;
+- цветовая согласованность тени;
+- отношение яркостного градиента к цветовому градиенту.
+
+---
+
+### 1.3. Практичные признаки для детекции hard shadows
+
+#### 1. Яркостные признаки
+
+Работать лучше в цветовом пространстве **LAB** или **Luminance**, а не в сыром RGB.
+
+Пример признаков:
+
+- `L_std` — стандартное отклонение яркости.
+- `L_p95_minus_p5` — динамический диапазон по перцентилям.
+- `local_contrast_p95` — 95-й перцентиль локального стандартного отклонения яркости.
+- `sobel_p95` — 95-й перцентиль градиента яркости.
+- `canny_ratio` — доля пикселей с сильными границами.
+- `dark_area_ratio` — доля пикселей, которые темнее локального фона.
+- `bright_area_ratio` — доля пересвеченных областей.
+- `shadow_boundary_length` — суммарная длина границ тёмных областей.
+- `boundary_contrast` — средний перепад яркости на границах тёмных областей.
+
+#### 2. Цветовые признаки
+
+Тень часто темнее, но не обязательно сильно отличается по цвету. Тёмный объект может быть другого цвета, а тень часто сохраняет похожий оттенок, только становится темнее и иногда слегка смещается в синюю сторону.
+
+Полезны:
+
+- `a_std`, `b_std` в LAB.
+- `chroma_std`.
+- Разница `a/b` между светлой и тёмной стороной границы.
+- Отношение яркостного градиента к цветовому градиенту:
+  - если яркость резко меняется, а цвет почти нет — похоже на тень;
+  - если резко меняется и цвет — возможно, это объект, а не тень.
+
+#### 3. Граничные признаки
+
+Жёсткая тень даёт резкий переход. Можно считать:
+
+- Canny edges по каналу L.
+- Градиент поперёк найденных границ.
+- Разницу яркости слева/справа от границы.
+- Ширину перехода: у мягкой тени переход широкий, у жёсткой — узкий.
+
+Упрощённая идея:
+
+```text
+edge_score = mean(gradient magnitude on shadow boundaries)
+brightness_drop = mean(L_bright_side - L_dark_side)
+transition_width = distance between 10% and 90% intensity across edge
+hard_shadow_score ~ edge_score * brightness_drop / transition_width
+```
+
+#### 4. Региональные признаки
+
+Можно построить маску “подозрительно тёмных областей”:
+
+```text
+L_local_mean = blur(L, large_kernel)
+L_local_std  = local_std(L)
+
+dark_mask = L < L_local_mean - k * L_local_std
+```
+
+Затем анализировать:
+
+- площадь `dark_mask`;
+- связность областей;
+- длину границ;
+- контраст на границах;
+- форму областей.
+
+Для строительной площадки это часто лучше, чем попиксельная классификация.
+
+---
+
+### 1.4. Готовые подходы и open-source решения по shadow detection
+
+#### Вариант 1: Классические методы
+
+Это лучший старт.
+
+Типовые подходы:
+
+1. **HSV / HSL based shadow detection**
+   - Тень часто имеет меньшую яркость `V` или `L`.
+   - Оттенок `H` меняется слабее.
+   - Просто, но много ложных срабатываний на тёмных объектах.
+
+2. **Normalized RGB**
+   - Нормализация `r = R/(R+G+B)`, `g = G/(R+G+B)`.
+   - Помогает отделить изменение освещённости от изменения материала.
+
+3. **Invariant image / physical shadow detection**
+   - Подходы Finlayson и связанные.
+   - Идея: построить инвариантное изображение, где тени частично исчезают.
+   - Хорошо для теории, но на практике требует аккуратной настройки.
+
+4. **Gradient / edge based**
+   - Искать резкие яркостные границы с малым цветовым отличием.
+   - Очень практично для вашей задачи.
+
+5. **Superpixel based**
+   - Разбить изображение на SLIC-суперпиксели.
+   - Классифицировать регионы: тень / не тень.
+   - Затем анализировать границы регионов.
+
+#### Вариант 2: Видео / временной анализ
+
+Если у вас не просто отдельные фото, а кадры из видео со стационарной камеры, можно использовать:
+
+- `cv2.createBackgroundSubtractorMOG2(detectShadows=True)`
+- `cv2.createBackgroundSubtractorKNN(detectShadows=True)`
+
+Это есть прямо в OpenCV.
+
+Но это работает, когда есть фон и движущиеся объекты/тени. Для дрона с сильным смещением камеры это сложнее: сначала нужна стабилизация или регистрация кадров.
+
+#### Вариант 3: Нейросетевые shadow detection модели
+
+На GitHub и Papers with Code можно найти модели для shadow detection:
+
+- U-Net-like segmentation models.
+- Deep shadow detection networks.
+- Models trained on SBU Shadow, UCF Shadow и других датасетах.
+
+Где искать:
+
+- https://github.com/topics/shadow-detection
+- https://paperswithcode.com/task/shadow-detection
+- запросы:
+  - `shadow detection single image`
+  - `hard shadow detection`
+  - `shadow segmentation python`
+  - `aerial shadow detection`
+  - `remote sensing shadow detection`
+
+**Но важно:** большинство таких репозиториев — исследовательские. Они могут быть:
+
+- без удобного inference;
+- под старый PyTorch/TensorFlow;
+- обучены на бытовых фото с людьми;
+- плохо переноситься на промышленные площадки;
+- требовать GPU.
+
+Поэтому для первого прототипа лучше классика + калибровка на ваших данных.
+
+---
+
+## 2. Инструменты и библиотеки
+
+### 2.1. Сравнение основных библиотек
+
+| Библиотека | Для чего хороша | Плюсы | Минусы |
+|---|---|---|---|
+| **OpenCV** | Основная обработка | Быстро, много функций, Canny, Sobel, morphology, resize | API местами неудобный, BGR по умолчанию, некоторые модули в contrib |
+| **scikit-image** | Научная обработка | Удобные фильтры, local entropy, SLIC, morphology | Медленнее OpenCV |
+| **Pillow** | IO, thumbnails | Просто, удобно для превью | Слаба для серьёзного анализа |
+| **NumPy** | Массивы, метрики | Основа всего | Нужно писать самому |
+| **SciPy** | Фильтры, морфология, статистика | Удобно | Может быть медленнее OpenCV |
+| **scikit-learn** | Калибровка порогов, классификаторы | LogisticRegression, RandomForest, metrics | Не для图像处理 |
+| **pyvips / libvips** | Очень большие изображения | Быстро, экономно по памяти | Меньше CV-функций |
+| **ExifTool** | Метаданные | Самый надёжный | Внешний Perl-инструмент |
+| **pyexiftool** | Python + ExifTool | Удобно из Python | Требует установленный ExifTool |
+| **pyexiv2 / exiv2** | Метаданные | Нативная библиотека | Может быть сложнее в установке |
+| **ONNX Runtime** | Лёгкий inference | Хорошо для CPU | Нужно конвертировать модель |
+| **OpenVINO** | Intel CPU inference | Быстро на Intel | Требует экосистему |
+| **Streamlit** | Быстрый GUI | Минимум кода | Не для очень сложных интерфейсов |
+| **Gradio** | ML UI | Очень быстро показать результат | Меньше гибкости |
+| **FastAPI** | Сервер | API, background jobs, масштабируемость | Больше кода |
+| **Label Studio** | Ручная разметка | Готовый локальный сервер разметки | Нужно интегрировать экспорт |
+
+---
+
+### 2.2. Что выбрать для расчёта контраста
+
+Для быстрого прототипа:
+
+```text
+OpenCV + NumPy + scikit-image
+```
+
+Примерное распределение:
+
+- **OpenCV**: imread, resize, blur, Sobel, Canny, morphology.
+- **scikit-image**: local entropy, SLIC, filters, удобные утилиты.
+- **NumPy**: перцентили, статистики, маски.
+- **scikit-learn**: калибровка порогов на размеченных данных.
+
+Если изображения очень большие и их много:
+
+```text
+pyvips для decode/resize + OpenCV/NumPy для анализа
+```
+
+---
+
+### 2.3. Можно ли запускать без GPU?
+
+Да, можно и даже нужно для первого прототипа.
+
+Если анализировать не полные 20–50 МП, а уменьшенную версию изображения, например:
+
+```text
+max_side = 1024 или 1600 px
+```
+
+то классический алгоритм на CPU работает нормально.
+
+Примерная производительность на среднем ПК:
+
+- JPEG 20 МП decode: 50–200 мс.
+- Resize до 1024–1600 px: 10–40 мс.
+- Расчёт признаков: 30–150 мс.
+- Запись метаданных ExifTool: 10–100 мс на файл.
+
+Для 10 000 фото реальное время обработки может быть от 30 минут до нескольких часов, зависит от диска, CPU и размера фото.
+
+---
+
+## 3. Работа с метаданными
+
+### 3.1. Что нужно ACDSee
+
+ACDSee обычно хорошо работает со стандартными метаданными:
+
+- EXIF
+- IPTC
+- XMP
+
+Для вашей задачи лучше использовать не экзотические custom-поля, а стандартные поля, которые ACDSee сможет показать и отфильтровать.
+
+---
+
+### 3.2. Рекомендуемые поля
+
+| Поле | Что писать | Почему |
+|---|---|---|
+| **XMP xmp:Rating** | 5 — good, 3 — review, 1 — bad | Стандартный рейтинг, удобно фильтровать |
+| **XMP xmp:Label** | `Good`, `Review`, `Rejected` | Текстовая метка / label |
+| **XMP dc:subject** | `QC_GOOD`, `QC_REVIEW`, `QC_BAD_HARD_SHADOW` | Keywords, стандарт XMP |
+| **IPTC Keywords** | Те же ключевые слова | Совместимость |
+| **Custom XMP** | Только если очень нужно | Может не читаться/не фильтроваться в ACDSee |
+
+Рекомендуемая схема:
+
+```text
+Good:
+  Rating = 5
+  Label = Good
+  Keywords = QC_GOOD, NO_HARD_SHADOW
+
+Review:
+  Rating = 3
+  Label = Review
+  Keywords = QC_REVIEW, POSSIBLE_HARD_SHADOW
+
+Bad:
+  Rating = 1
+  Label = Rejected
+  Keywords = QC_BAD, HARD_SHADOW
+```
+
+Можно использовать более подробные ключевые слова:
+
+```text
+QC_GOOD
+QC_REVIEW
+QC_BAD_HARD_SHADOW
+QC_BAD_HIGH_CONTRAST
+QC_BAD_MOVING_SHADOW
+QC_BAD_OVEREXPOSED
+QC_BAD_UNDEREXPOSED
+```
+
+---
+
+### 3.3. Пример команд ExifTool
+
+#### Хороший кадр
+
+```bash
+exiftool -overwrite_original -P \
+  -XMP-xmp:Rating=5 \
+  -XMP-xmp:Label="Good" \
+  -XMP-dc:Subject+="QC_GOOD" \
+  -IPTC:Keywords+="QC_GOOD" \
+  image.jpg
+```
+
+#### Плохой кадр
+
+```bash
+exiftool -overwrite_original -P \
+  -XMP-xmp:Rating=1 \
+  -XMP-xmp:Label="Rejected" \
+  -XMP-dc:Subject+="QC_BAD_HARD_SHADOW" \
+  -IPTC:Keywords+="QC_BAD_HARD_SHADOW" \
+  image.jpg
+```
+
+#### Пограничный кадр
+
+```bash
+exiftool -overwrite_original -P \
+  -XMP-xmp:Rating=3 \
+  -XMP-xmp:Label="Review" \
+  -XMP-dc:Subject+="QC_REVIEW" \
+  -IPTC:Keywords+="QC_REVIEW" \
+  image.jpg
+```
+
+Где:
+
+- `-overwrite_original` — не создавать backup.
+- `-P` — сохранять исходную дату модификации файла.
+- `+=` — добавить значение к списку, а не перезаписать весь список.
+
+Но для ACDSee иногда лучше, чтобы дата файла изменилась, иначе программа может не сразу обновить базу. Поэтому:
+
+1. Сначала тестируйте без `-P`.
+2. Если ACDSee видит метаданные нормально, решайте, нужно ли сохранять дату.
+
+---
+
+### 3.4. Пакетная запись через CSV
+
+Можно подготовить CSV:
+
+```csv
+SourceFile,Rating,Label,Keywords
+/photos/DJI_0001.JPG,5,Good,"QC_GOOD,NO_HARD_SHADOW"
+/photos/DJI_0002.JPG,1,Rejected,"QC_BAD,HARD_SHADOW"
+/photos/DJI_0003.JPG,3,Review,"QC_REVIEW,POSSIBLE_HARD_SHADOW"
+```
+
+Пример применения:
+
+```bash
+exiftool -csv=qc.csv -overwrite_original -sep ", " /photos/
+```
+
+Но точное поведение зависит от версии ExifTool и тегов, поэтому лучше сначала тестировать на 10–20 файлах.
+
+---
+
+### 3.5. Библиотеки для метаданных
+
+| Инструмент | Плюсы | Минусы |
+|---|---|---|
+| **ExifTool** | Самый надёжный, поддерживает огромное количество тегов, XMP/IPTC/EXIF | Внешний инструмент, не всегда удобно из Python |
+| **pyexiftool** | Удобно вызывать ExifTool из Python | Требует установленный ExifTool |
+| **exiv2** | Хорошая нативная библиотека | Установка и сборка могут быть сложнее |
+| **pyexiv2** | Python-доступ к exiv2 | Зависит от системной библиотеки |
+| **piexif** | Простой для EXIF | Плохо подходит для XMP/IPTC/keywords/rating |
+| **python-xmp-toolkit** | Работа с XMP | Старый, тяжёлый, не самый удобный |
+| **Pillow** | Может читать/писать часть метаданных | Недостаточно надёжно для серьёзной XMP/IPTC-разметки |
+
+**Рекомендация:**  
+Для записи разметки в файлы используйте **ExifTool**, напрямую или через **pyexiftool**.
+
+---
+
+## 4. Архитектура решения
+
+Ниже — три варианта реализации: от простого к более серьёзному.
+
+---
+
+# Вариант 1. Простой CLI-скрипт
+
+Это лучший вариант для первого прототипа.
+
+##Pipeline
+
+```text
+1. Входная папка с фотографиями.
+2. Поиск JPG/JPEG/TIF/PNG.
+3. Для каждого файла:
+   - прочитать изображение;
+   - уменьшить до max_side = 1024/1600;
+   - перевести в LAB;
+   - посчитать яркостные и теневые признаки;
+   - применить правила или обученный классификатор;
+   - получить класс: good / review / bad.
+4. Сохранить CSV:
+   - filename;
+   - decision;
+   - rating;
+   - shadow_score;
+   - local_contrast;
+   - dark_area_ratio;
+   - другие признаки.
+5. Применить метаданные через ExifTool.
+6. Сформировать отчёт и debug-изображения.
+```
+
+## Библиотеки
+
+```text
+Python 3.11+
+opencv-python
+scikit-image
+numpy
+pandas
+tqdm
+pyyaml
+pyexiftool или прямой вызов exiftool
+scikit-learn — если делать калибровку
+```
+
+## Примерная структура проекта
+
+```text
+shadow-qc/
+  config.yaml
+  requirements.txt
+  src/
+    cli.py
+    features.py
+    classify.py
+    metadata.py
+    utils.py
+  scripts/
+    calibrate.py
+    apply_metadata.py
+  debug/
+    masks/
+    overlays/
+  data/
+    input/
+    labeled.csv
+    predictions.csv
+```
+
+## Объём кода
+
+Для базовой версии:
+
+```text
+300–700 строк Python
+```
+
+Если делать аккуратно, с конфигами, логами и debug-визуализацией:
+
+```text
+800–1500 строк
+```
+
+## Как организовать пороги
+
+Пример конфига `config.yaml`:
+
+```yaml
+input_dir: data/input
+output_csv: data/predictions.csv
+debug_dir: debug
+
+image:
+  max_side: 1280
+  denoise: median3
+  jpeg_reduced_read: true
+
+features:
+  local_window: 31
+  canny_low: 50
+  canny_high: 150
+  dark_sigma_threshold: 0.7
+  percentile_low: 1
+  percentile_high: 99
+
+classification:
+  mode: rules
+  good_shadow_score_max: 0.25
+  bad_shadow_score_min: 0.55
+  good_local_contrast_max: 0.22
+  bad_local_contrast_min: 0.38
+  dark_area_bad_min: 0.15
+
+metadata:
+  write: true
+  rating_good: 5
+  rating_review: 3
+  rating_bad: 1
+  keyword_prefix: "QC_"
+```
+
+Правила могут быть такими:
+
+```text
+good:
+  shadow_score < good_shadow_score_max
+  local_contrast_p95 < good_local_contrast_max
+
+bad:
+  shadow_score > bad_shadow_score_min
+  local_contrast_p95 > bad_local_contrast_min
+
+review:
+  всё остальное
+```
+
+---
+
+# Вариант 2. Скрипт + простой GUI
+
+Это оптимальный вариант, если нужно быстро крутить пороги и смотреть результат.
+
+## Что добавить
+
+Использовать:
+
+- **Streamlit** или **Gradio**.
+
+Streamlit обычно удобнее для табличных результатов и галереи.
+
+## Возможности GUI
+
+Интерфейс может показывать:
+
+1. Список файлов.
+2. Превью изображения.
+3. Overlay:
+   - найденные тёмные области;
+   - границы теней;
+   - heatmap shadow_score.
+4. Признаки:
+   - local contrast;
+   - shadow score;
+   - dark area ratio;
+   - edge density.
+5. Слайдеры порогов:
+   - good threshold;
+   - bad threshold;
+   - dark area threshold.
+6. Кнопки:
+   - Run batch;
+   - Save CSV;
+   - Write metadata;
+   - Refresh ACDSee-compatible tags.
+
+## Pipeline
+
+```text
+1. Пользователь выбирает папку.
+2. Скрипт строит thumbnails.
+3. Считает признаки.
+4. Показывает таблицу и превью.
+5. Пользователь двигает пороги.
+6. Классы пересчитываются.
+7. Пользователь подтверждает запись метаданных.
+8. ExifTool пишет Rating/Keywords/Label.
+```
+
+## Библиотеки
+
+```text
+streamlit
+opencv-python
+scikit-image
+pandas
+plotly — опционально для графиков
+pyexiftool
+```
+
+## Объём кода
+
+```text
+700–2000 строк
+```
+
+Если делать аккуратно с кэшем признаков:
+
+```text
+1500–3000 строк
+```
+
+## Важная идея
+
+Признаки нужно считать один раз и кэшировать.
+
+Например:
+
+```text
+features.parquet
+thumbnails/
+debug_masks/
+```
+
+Тогда смена порогов в GUI будет мгновенной.
+
+---
+
+# Вариант 3. Продвинутый локальный сервис с ручной корректировкой
+
+Это вариант, если задача станет регулярной и нужно будет обучать систему на исправлениях оператора.
+
+## Архитектура
+
+```text
+Frontend:
+  Streamlit / Gradio / FastAPI templates / Label Studio
+
+Backend:
+  FastAPI
+
+База:
+  SQLite для прототипа
+  PostgreSQL для продакшена
+
+Worker:
+  фоновая обработка изображений
+
+Очередь:
+  RQ / Celery / ARQ — опционально
+
+Разметка:
+  Label Studio или собственный интерфейс
+
+Метаданные:
+  ExifTool
+
+ML:
+  scikit-learn / ONNX Runtime / PyTorch — опционально
+```
+
+## Pipeline
+
+```text
+1. Загрузка или указание папки.
+2. Backend создаёт задание.
+3. Worker считает признаки.
+4. Классификатор предсказывает good/review/bad.
+5. Результаты сохраняются в БД.
+6. Оператор видит галерею и корректирует классы.
+7. Исправления сохраняются как ground truth.
+8. Периодически модель переобучается.
+9. Финальные метки пишутся в файлы через ExifTool.
+```
+
+## Ручная корректировка
+
+Тут есть два пути.
+
+### Путь A: Label Studio
+
+Label Studio — очень интересный GitHub-репозиторий для вашей задачи:
+
+https://github.com/HumanSignal/label-studio
+
+Он даёт:
+
+- локальный сервер;
+- веб-интерфейс;
+- ручную разметку;
+- экспорт в JSON/CSV;
+- возможность быстро собрать интерфейс вида:
+  - Good;
+  - Review;
+  - Bad.
+
+Плюс:
+
+- не нужно писать сложный UI с нуля.
+
+Минус:
+
+- нужно интегрировать экспорт разметки в ваш pipeline записи метаданных.
+
+### Путь B: Свой интерфейс в Streamlit/FastAPI
+
+Плюсы:
+
+- полный контроль;
+- можно сразу показывать shadow masks;
+- можно сразу писать метаданные.
+
+Минусы:
+
+- больше кода.
+
+## Объём кода
+
+Для продвинутой версии:
+
+```text
+2000–6000 строк
+```
+
+С Docker, очередями, БД, авторизацией и тестами:
+
+```text
+5000–15000 строк
+```
+
+---
+
+## 5. Практические рекомендации
+
+### 5.1. На что обратить внимание на промышленных фото
+
+Строительная площадка — сложная сцена.
+
+Основные проблемы:
+
+#### 1. Бетон и однородные поверхности
+
+Бетон может быть светлым, но с текстурой.  
+Тень на бетоне хорошо видна, но алгоритм может перепутать:
+
+- тень;
+- мокрый бетон;
+- тёмное покрытие;
+- следы техники.
+
+**Рекомендация:**  
+Использовать не только яркость, но и локальный контраст, границы, цветовую согласованность.
+
+---
+
+#### 2. Металл и блики
+
+Металл даёт:
+
+- пересветы;
+- блики;
+- резкие светлые точки;
+- тёмные отражения.
+
+**Рекомендация:**  
+Использовать перцентили, а не min/max.  
+Исключать или отдельно помечать clipped highlights:
+
+```text
+L > 0.98 или 0.99
+```
+
+---
+
+#### 3. Тёмные объекты
+
+Тёмные объекты могут выглядеть как тени:
+
+- чёрная техника;
+- тёмные тенты;
+- битум;
+- мокрые участки;
+- трубы;
+- кабельные трассы.
+
+**Рекомендация:**  
+Проверять, что тёмная область имеет:
+
+- большую площадь;
+- резкую границу;
+- низкий цветовой сдвиг относительно светлой стороны;
+- характерную форму.
+
+---
+
+#### 4. Переменное освещение
+
+Облака, солнце, дымка, пыль сильно меняют глобальную яркость.
+
+**Рекомендация:**  
+Не использовать абсолютные пороги яркости.  
+Использовать:
+
+- локальную нормализацию;
+- перцентильную нормализацию;
+- признаки относительно локального фона.
+
+Пример:
+
+```text
+L_norm = (L - p1) / (p99 - p1)
+```
+
+---
+
+#### 5. Разное время суток
+
+Утром тени длинные, но могут быть мягче или холоднее.  
+Днём тени короткие, но жёсткие.  
+Вечером контраст может падать.
+
+**Рекомендация:**  
+Если в EXIF есть время, можно использовать его как дополнительный признак, но не полагаться на него полностью.
+
+---
+
+### 5.2. Как калибровать пороги
+
+Самый правильный путь:
+
+#### Шаг 1. Собрать ручной набор
+
+Возьмите:
+
+```text
+100–500 фотографий
+```
+
+Обязательно включите:
+
+- хорошие кадры;
+- явно плохие;
+- спорные;
+- утро;
+- день;
+- вечер;
+- облачную погоду;
+- солнечную погоду;
+- разные типы сцен.
+
+#### Шаг 2. Разметить вручную
+
+Можно в ACDSee или в CSV:
+
+```csv
+filename,label
+DJI_0001.JPG,good
+DJI_0002.JPG,bad
+DJI_0003.JPG,review
+```
+
+#### Шаг 3. Извлечь признаки
+
+Сохранить все признаки в таблицу:
+
+```text
+filename
+L_std
+local_contrast_p95
+sobel_p95
+canny_ratio
+dark_area_ratio
+shadow_boundary_length
+boundary_contrast
+chroma_diff
+shadow_score
+```
+
+#### Шаг 4. Подобрать пороги
+
+Сначала можно вручную:
+
+```text
+good if shadow_score < 0.25
+bad if shadow_score > 0.55
+else review
+```
+
+Потом лучше использовать простую модель:
+
+```text
+LogisticRegression
+RandomForest
+GradientBoosting
+```
+
+Для начала достаточно:
+
+```python
+from sklearn.linear_model import LogisticRegression
+```
+
+Модель должна предсказывать:
+
+```text
+good / review / bad
+```
+
+или два бинарных классификатора:
+
+```text
+is_bad
+is_good
+```
+
+#### Шаг 5. Выбрать метрики
+
+Для вашей задачи важно понимать цену ошибок.
+
+Ошибки бывают двух типов:
+
+1. **Плохой кадр помечен как хороший**  
+   Очень плохо, потому что он пойдёт в стабилизацию и испортит результат.
+
+2. **Хороший кадр помечен как плохой**  
+   Теряем полезный кадр, но это менее страшно.
+
+Поэтому можно оптимизировать:
+
+```text
+high recall for bad class
+acceptable precision for good class
+```
+
+И использовать промежуточный класс `review`.
+
+---
+
+### 5.3. Возможные подводные камни
+
+#### 1. JPEG-сжатие
+
+JPEG даёт блочные артефакты, особенно на границах тени.
+
+**Что делать:**
+
+- лёгкий denoise перед анализом;
+- median blur 3x3 или 5x5;
+- не использовать слишком тонкие пороги градиента.
+
+---
+
+#### 2. Разный баланс белого
+
+RGB-пороги будут нестабильны.
+
+**Что делать:**
+
+- использовать LAB;
+- использовать normalized RGB;
+- анализировать яркость и цвет отдельно.
+
+---
+
+#### 3. Пересветы и недоэкспозиция
+
+Если много клиппинга, метрики контраста врут.
+
+**Что делать:**
+
+- считать долю clipped highlights/shadows;
+- если `clipped_ratio` высокая, помечать как `QC_REVIEW` или `QC_BAD_EXPOSURE`.
+
+---
+
+#### 4. Высокая текстура сцены
+
+Арматура, щебень, опалубка дают много границ.
+
+**Что делать:**
+
+- различать мелкую текстуру и крупные теневые границы;
+- использовать multi-scale анализ;
+- считать не только edge density, но и размер связанных тёмных областей.
+
+---
+
+#### 5. Тени от движущейся техники
+
+Если тень от крана, экскаватора, дрона, людей — она может быть особенно вредной для стабилизации.
+
+**Что делать:**
+
+- если есть последовательность кадров, можно анализировать временную согласованность;
+- если только одиночные фото — использовать форму и резкость.
+
+---
+
+#### 6. ACDSee не сразу видит новые метаданные
+
+Такое возможно, особенно если дата файла не изменилась.
+
+**Что делать:**
+
+- тестировать на 10 файлах;
+- попробовать без `-P`;
+- принудительно обновить базу ACDSee;
+- проверить, какие поля ACDSee реально отображает:
+  - Rating;
+  - Keywords;
+  - Label;
+  - Categories.
+
+---
+
+## 6. Рекомендуемый набор признаков для первого прототипа
+
+Я бы начал с такого набора.
+
+### Изображение
+
+```text
+resize max_side = 1280
+medianBlur 3x3 или 5x5
+convert to LAB
+L = luminance
+a, b = color channels
+normalize L by p1 and p99
+```
+
+### Глобальные признаки
+
+```text
+L_mean
+L_std
+L_p1
+L_p5
+L_p95
+L_p99
+L_dynamic_range = p95 - p5
+michelson_percentile = (p99 - p1) / (p99 + p1 + eps)
+L_entropy
+clipped_highlight_ratio
+clipped_shadow_ratio
+```
+
+### Локальные признаки
+
+```text
+local_mean = blur(L, 31x31)
+local_std = sqrt(blur(L^2) - local_mean^2)
+local_contrast_p50
+local_contrast_p90
+local_contrast_p95
+local_contrast_p99
+```
+
+### Градиентные признаки
+
+```text
+sobel = magnitude(Sobel(L))
+sobel_mean
+sobel_p90
+sobel_p95
+sobel_p99
+
+canny = Canny(L)
+edge_pixel_ratio
+strong_edge_ratio
+```
+
+### Теневые признаки
+
+```text
+dark_mask = L < local_mean - k * local_std
+dark_area_ratio
+
+shadow_boundary = boundary(dark_mask)
+shadow_boundary_length_norm
+boundary_gradient_mean
+boundary_brightness_drop_mean
+boundary_chroma_diff_mean
+
+shadow_score = weighted combination:
+  0.40 * boundary_brightness_drop_norm
+  0.25 * boundary_gradient_norm
+  0.20 * dark_area_ratio_norm
+  0.15 * boundary_length_norm
+```
+
+Веса лучше не брать навсегда, а подобрать на размеченных данных.
+
+---
+
+## 7. Пример простой логики классификации
+
+### Правила
+
+```text
+if clipped_highlight_ratio > 0.20:
+    decision = review
+    reason = overexposed
+
+elif shadow_score < 0.25 and local_contrast_p95 < 0.25:
+    decision = good
+
+elif shadow_score > 0.55 and local_contrast_p95 > 0.35:
+    decision = bad
+
+else:
+    decision = review
+```
+
+### Более правильный вариант
+
+Обучить простую модель:
+
+```text
+features -> LogisticRegression -> probabilities
+```
+
+Затем:
+
+```text
+if P(bad) > 0.70:
+    bad
+elif P(good) > 0.70:
+    good
+else:
+    review
+```
+
+Пороги вероятностей тоже настраивать вручную.
+
+---
+
+## 8. Где искать готовые shadow detection репозитории
+
+Прямые ссылки для поиска:
+
+### GitHub
+
+```text
+https://github.com/topics/shadow-detection
+https://github.com/topics/shadow-removal
+https://github.com/search?q=shadow+detection+python
+https://github.com/search?q=hard+shadow+detection
+https://github.com/search?q=aerial+shadow+detection
+https://github.com/search?q=remote+sensing+shadow+detection
+```
+
+### Papers with Code
+
+```text
+https://paperswithcode.com/task/shadow-detection
+```
+
+### Что искать
+
+```text
+shadow detection single image
+hard shadow detection
+shadow segmentation
+moving cast shadow detection
+aerial image shadow detection
+remote sensing shadow detection
+invariant image shadow detection
+Finlayson shadow detection
+HSV shadow detection
+superpixel shadow detection
+```
+
+### Практичная оценка репозиториев
+
+Перед использованием проверяйте:
+
+1. Есть ли inference-скрипт.
+2. Есть ли pretrained weights.
+3. На каком датасете обучено.
+4. Лицензию.
+5. Зависимости.
+6. Работает ли на CPU.
+7. Есть ли тесты / примеры.
+8. Сколько звёзд, issues, последний коммит.
+
+Для вашей задачи исследовательская модель может быть полезна как источник признаков или маска теней, но не как финальное решение без калибровки.
+
+---
+
+## 9. Рекомендация по стеку
+
+### Самый практичный быстрый прототип
+
+```text
+Python 3.11
+OpenCV
+scikit-image
+NumPy
+pandas
+scikit-learn
+ExifTool
+pyexiftool
+Streamlit или Gradio
+```
+
+### Почему именно так
+
+Плюсы:
+
+- быстро разрабатывается;
+- работает без GPU;
+- легко калибровать;
+- легко писать метаданные;
+- легко показать результат оператору;
+- не зависит от тяжёлых нейросетей.
+
+Минусы:
+
+- нужно подбирать признаки;
+- для очень сложных случаев может понадобиться ML-модель.
+
+---
+
+### Если нужен более серьёзный локальный сервис
+
+```text
+FastAPI
+SQLite/PostgreSQL
+Streamlit или FastAPI frontend
+Label Studio
+ExifTool
+ONNX Runtime — опционально
+Docker — опционально
+```
+
+Это имеет смысл, если:
+
+- фотографий очень много;
+- нужно несколько операторов;
+- нужна история исправлений;
+- нужно дообучение;
+- нужна интеграция с другими системами.
+
+---
+
+## 10. Конкретный рекомендуемый план на первую неделю
+
+### День 1. Разметка тестовой выборки
+
+1. Отобрать 150–300 фото.
+2. Вручную пометить:
+   - good;
+   - review;
+   - bad.
+3. Сохранить CSV.
+
+### День 2. Извлечение признаков
+
+1. Написать скрипт чтения фото.
+2. Resize до 1280 px.
+3. LAB, L channel.
+4. Посчитать:
+   - local contrast;
+   - edge density;
+   - dark area ratio;
+   - boundary contrast;
+   - shadow score.
+5. Сохранить `features.parquet` или `features.csv`.
+
+### День 3. Калибровка
+
+1. Построить графики признаков.
+2. Посмотреть, чем good/review/bad отличаются.
+3. Подобрать пороги.
+4. Попробовать LogisticRegression.
+5. Оценить confusion matrix.
+
+### День 4. Запись метаданных
+
+1. Сформировать CSV решений.
+2. Написать ExifTool-скрипт.
+3. Протестировать на 20 файлах.
+4. Открыть в ACDSee.
+5. Проверить фильтры:
+   - Rating;
+   - Keywords;
+   - Label.
+
+### День 5. GUI
+
+1. Streamlit-приложение.
+2. Галерея thumbnails.
+3. Таблица признаков.
+4. Слайдеры порогов.
+5. Кнопка Write metadata.
+
+### День 6. Debug-визуализация
+
+Показывать overlay:
+
+- исходное фото;
+- L channel;
+- dark mask;
+- shadow boundaries;
+- heatmap shadow_score.
+
+Это критически важно для настройки.
+
+### День 7. Пакетная обработка
+
+1. Обработка всей папки.
+2. Запись CSV.
+3. Запись метаданных.
+4. Лог ошибок.
+5. Финальная проверка в ACDSee.
+
+---
+
+## 11. Итоговая рекомендация
+
+Для вашей задачи я бы рекомендовал следующий подход.
+
+### Минимально практичный рабочий вариант
+
+```text
+Python + OpenCV + scikit-image + ExifTool + Streamlit
+```
+
+### Что считать
+
+Не просто общий контраст, а набор признаков:
+
+```text
+local contrast p95
+sobel p95
+edge density
+dark area ratio
+shadow boundary length
+boundary brightness drop
+chromatic consistency
+shadow_score
+```
+
+### Как писать метаданные
+
+```text
+XMP xmp:Rating
+XMP xmp:Label
+XMP dc:subject
+IPTC Keywords
+```
+
+Пример:
+
+```text
+Good:
+  Rating = 5
+  Label = Good
+  Keywords = QC_GOOD, NO_HARD_SHADOW
+
+Review:
+  Rating = 3
+  Label = Review
+  Keywords = QC_REVIEW, POSSIBLE_HARD_SHADOW
+
+Bad:
+  Rating = 1
+  Label = Rejected
+  Keywords = QC_BAD, HARD_SHADOW
+```
+
+### Когда добавлять нейросети
+
+Добавлять ML/Deep Learning стоит, если:
+
+1. Классические признаки уже дают приемлемый результат, но хочется выше точность.
+2. Есть размеченная выборка от 300–1000 изображений.
+3. Есть время на интеграцию ONNX/OpenVINO.
+4. Есть сложные случаи: тёмные объекты, мокрые поверхности, металл, переменное освещение.
+
+Для первого прототипа нейросеть, скорее всего, будет избыточна и менее управляема.
+
+---
+
+## 12. Самая практичная архитектура
+
+Если нужно быстро получить пользу:
+
+```text
+CLI + Streamlit + ExifTool
+```
+
+Если нужно сделать полноценный локальный инструмент:
+
+```text
+FastAPI + SQLite + Streamlit/Label Studio + ExifTool
+```
+
+Если нужно максимально быстро собрать ручную корректировку:
+
+```text
+Label Studio + Python pipeline + ExifTool
+```
+
+---
+
+## 13. Финальный рекомендуемый стек
+
+```text
+Язык:
+  Python 3.11+
+
+Обработка изображений:
+  OpenCV
+  scikit-image
+  NumPy
+  Pillow
+
+Калибровка / ML:
+  scikit-learn
+
+Метаданные:
+  ExifTool
+  pyexiftool
+
+GUI:
+  Streamlit или Gradio
+
+Серверный вариант:
+  FastAPI
+  SQLite
+  watchdog
+  Label Studio
+
+Опционально:
+  ONNX Runtime
+  OpenVINO
+  pyvips
+  rawpy
+```
+
+Это даст вам не одноразовый скрипт, а нормальный локальный инструмент, который можно развивать: сначала правила и пороги, потом обучение на исправлениях оператора, затем при необходимости — нейросетевая сегментация теней.

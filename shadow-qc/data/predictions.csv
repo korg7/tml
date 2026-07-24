@@ -1,0 +1,2 @@
+filename,decision,rms_contrast,michelson_pct,dynamic_range,histogram_entropy,bimodality,clipped_highlight_ratio,local_contrast_p95,local_contrast_p50,sobel_p95,edge_pixel_ratio,shadow_area_ratio,boundary_gradient_mean,boundary_brightness_drop,boundary_length_norm,chroma_diff_at_boundary,shadow_score
+data\input\test_shadow.jpg,review,0.4896266460418701,0.9999989867210388,0.999997615814209,1.2735916945622696,0.004859669357640313,0.45540729166666666,0.16207866370677948,0.0,0.0,0.0016666666666666668,0.006666666666666667,332.0,0.0,1.1094003924504583,0.0,0.4581366862891896

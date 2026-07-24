@@ -1,0 +1,18 @@
+# Локальная конфигурация IDE / AI-провайдеров (содержит ключи!)
+opencode.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Отладочные артефакты
+shadow-qc/debug/
+
+# Системные файлы
+Thumbs.db
+.DS_Store
